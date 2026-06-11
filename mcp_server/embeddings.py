@@ -23,6 +23,11 @@ CACHE_FILE = Path(__file__).parent.parent / "data" / "embedding_cache_v2.json"
 
 EMBEDDING_MODEL = "models/gemini-embedding-2"
 
+# Process-wide in-memory cache. The on-disk file holds ~1.1k × 3072-dim
+# vectors (tens of MB), so parsing it on every embed_query() call adds
+# hundreds of ms to each search. Load it once, lazily, and reuse it.
+_cache: Optional[dict[str, list[float]]] = None
+
 
 def embed_query(text: str, api_key: Optional[str] = None) -> list[float]:
     """
@@ -37,7 +42,7 @@ def embed_query(text: str, api_key: Optional[str] = None) -> list[float]:
     the key is not set. Raises RuntimeError if both fail.
     """
     cache_key = "text:" + hashlib.sha256(text.encode()).hexdigest()
-    cache = _load_cache()
+    cache = _get_cache()
 
     if cache_key in cache:
         return cache[cache_key]
@@ -58,10 +63,15 @@ def embed_query(text: str, api_key: Optional[str] = None) -> list[float]:
         raise RuntimeError(f"Embedding failed and no cache hit: {exc}") from exc
 
 
-def _load_cache() -> dict[str, list[float]]:
-    if CACHE_FILE.exists():
-        return json.loads(CACHE_FILE.read_text())
-    return {}
+def _get_cache() -> dict[str, list[float]]:
+    """Return the process-wide cache, loading it from disk on first use."""
+    global _cache
+    if _cache is None:
+        if CACHE_FILE.exists():
+            _cache = json.loads(CACHE_FILE.read_text())
+        else:
+            _cache = {}
+    return _cache
 
 
 def _save_cache(cache: dict[str, list[float]]) -> None:
