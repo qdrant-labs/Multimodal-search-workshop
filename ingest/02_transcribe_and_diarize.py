@@ -1,21 +1,24 @@
 """
-Step 3: Transcribe downloaded audio files with OpenAI Whisper, diarize
-speaker turns using pyannote.audio, then identify named speakers with Gemini.
+Step 02: Transcribe downloaded audio files with Whisper, diarize speaker
+turns using pyannote.audio, then identify named speakers with Gemini.
 
 For each .mp3 in data/audio/ (that has a matching .json sidecar) the script:
-  - Loads the Whisper "base" model
+  - Loads the configured Whisper model (TRANSCRIBE_BACKEND/WHISPER_MODEL,
+    default faster-whisper "base")
   - Transcribes with word-level timestamps enabled
   - Runs pyannote.audio speaker diarization on the audio to get speaker segments
   - Assigns each word to a speaker segment, then groups words into ~30-second chunks
   - Groups chunks into larger paragraphs for Gemini context
-  - Sends each paragraph to Gemini 2.5 Flash-Lite to resolve speaker labels to
-    real names (e.g. "Jensen Huang") — falls back to "Speaker 0", "Speaker 1", etc.
+  - Sends each paragraph to Gemini Flash-Lite (IDENTIFICATION_MODEL) to resolve
+    speaker labels to real names (e.g. "Jensen Huang") — falls back to
+    "Speaker 0", "Speaker 1", etc.
   - Saves a structured JSON to data/transcripts/{ticker}_{quarter}_{year}.json
 
 Requirements:
   - HF_TOKEN env var: required to download pyannote models.
-    Accept the pyannote/speaker-diarization-3.1 license at:
-    https://huggingface.co/pyannote/speaker-diarization-3.1
+    Accept the license for the DIARIZATION_MODEL pipeline (default
+    pyannote/speaker-diarization-community-1, falls back to 3.1) at:
+    https://huggingface.co/pyannote/speaker-diarization-community-1
   - GEMINI_API_KEY env var: required for speaker name identification.
   - pip install pyannote.audio
 
@@ -61,12 +64,17 @@ from pydantic import BaseModel
 import warnings
 warnings.filterwarnings("ignore", module=r"pyannote\.audio\.core\.io")
 
+# Let unsupported MPS (Apple GPU) ops silently fall back to CPU instead of
+# crashing. Must be set BEFORE torch is imported anywhere, so we do it at
+# module import time (torch itself is imported lazily inside the functions).
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 load_dotenv()
 
 # Ensure ffmpeg is on PATH (uses static binary if system ffmpeg is absent)
 if not _shutil.which("ffmpeg"):
     try:
-        import static_ffmpeg  # type: ignore
+        import static_ffmpeg
         static_ffmpeg.add_paths()
     except ImportError:
         pass
@@ -77,12 +85,88 @@ TRANSCRIPT_DIR = Path(os.getenv("TRANSCRIPT_DIR", "./data/transcripts"))
 CHUNK_DURATION = 30.0  # seconds per chunk
 
 # Speaker identification model
-IDENTIFICATION_MODEL = "gemini-2.5-flash-lite"
-
-# Maximum tokens per paragraph sent to the speaker identification model.
-# Uses tiktoken cl100k_base as an offline approximation (~5-10% off for Gemini).
+IDENTIFICATION_MODEL = "gemini-3.1-flash-lite"
 IDENTIFY_TOKENS_PER_PARAGRAPH = 2048
 
+# Whisper config (env-overridable). Default model stays "base"; a smaller
+# model (e.g. "tiny"/"small") is the other speed lever. WHISPER_DEVICE can
+# force "cuda"/"mps"/"cpu"; otherwise the best available device is auto-picked.
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE")  # None → auto-select
+
+# Transcription backend selector. "faster-whisper" (CTranslate2) is the default:
+# it's ~3-5x faster on CPU (int8) than openai-whisper at the same accuracy, with
+# word timestamps. "openai-whisper" keeps the reference implementation. If
+# faster-whisper is selected but can't be imported/instantiated, transcribe_file
+# falls back to openai-whisper automatically.
+TRANSCRIBE_BACKEND = os.getenv("TRANSCRIBE_BACKEND", "faster-whisper").strip().lower()
+
+# Diarization model (env-overridable via DIARIZATION_MODEL). community-1 is the
+# newest pyannote pipeline (best accuracy) and is the default; 3.1 is kept as a
+# documented fallback that is tried automatically if the primary fails to load.
+DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+FALLBACK_DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
+
+
+_WHISPER_MPS_PATCHED = False
+
+
+def _patch_whisper_mps_dtw() -> None:
+    """Make Whisper's word-timestamp DTW step MPS-safe.
+
+    whisper.timing.dtw() does ``x.double().cpu()`` — but ``.double()`` runs on
+    the (MPS) tensor first, and MPS has no float64, raising
+    "Cannot convert a MPS Tensor to float64". PYTORCH_ENABLE_MPS_FALLBACK can't
+    intercept this because it's an explicit dtype cast, not an op-dispatch miss.
+    We wrap dtw to move the tensor to CPU *before* the cast. Idempotent and a
+    no-op for non-MPS tensors.
+    """
+    global _WHISPER_MPS_PATCHED
+    if _WHISPER_MPS_PATCHED:
+        return
+    try:
+        import whisper.timing as _wt
+
+        _orig_dtw = _wt.dtw
+
+        def _dtw_mps_safe(x: "Any") -> "Any":
+            # Match whisper's dtw(x: Tensor) -> np.ndarray; typed as Any so we
+            # don't need torch/numpy at import time.
+            if getattr(getattr(x, "device", None), "type", None) == "mps":
+                x = x.cpu()
+            return _orig_dtw(x)
+
+        # Intentional monkeypatch: our wrapper deliberately has a broader (Any)
+        # signature than whisper's concrete dtw(Tensor) -> ndarray.
+        _wt.dtw = _dtw_mps_safe  # ty: ignore[invalid-assignment]  # monkeypatch
+        _WHISPER_MPS_PATCHED = True
+    except Exception as exc:  # patch is best-effort
+        print(f"  [warn] could not apply Whisper MPS dtw patch: {exc}")
+
+
+def _best_torch_device(override: Optional[str] = None) -> str:
+    """Pick the best available torch device, preferring cuda → mps → cpu.
+
+    *override* (e.g. from WHISPER_DEVICE) forces a specific device when it is
+    valid and actually available; otherwise we fall back to auto-selection.
+    """
+    import torch
+
+    if override:
+        choice = override.strip().lower()
+        if choice == "cuda" and torch.cuda.is_available():
+            return "cuda"
+        if choice == "mps" and torch.backends.mps.is_available():
+            return "mps"
+        if choice == "cpu":
+            return "cpu"
+        print(f"  [warn] requested device '{override}' unavailable — auto-selecting")
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 # ---------------------------------------------------------------------------
 # Structured output schema for Gemini speaker identification
@@ -105,21 +189,116 @@ class ParagraphDiarization(BaseModel):
 
 def transcribe_file(mp3_path: Path) -> list[dict[str, Any]]:
     """
-    Transcribe a single mp3 with Whisper.
-    Returns a flat list of word dicts: {word, start, end}.
+    Transcribe a single mp3 and return a flat list of word dicts:
+    ``[{word, start, end}]``.
+
+    Dispatches on TRANSCRIBE_BACKEND ("faster-whisper" default | "openai-whisper").
+    If faster-whisper is selected but its import/instantiation fails, we fall
+    back to openai-whisper so environments without faster-whisper still work.
+    The returned shape is identical across backends — jobs.py / ingest/03
+    consume it unchanged.
     """
+    if TRANSCRIBE_BACKEND == "openai-whisper":
+        return _transcribe_openai_whisper(mp3_path)
+
+    # Default: faster-whisper, with graceful fallback to openai-whisper.
     try:
-        import whisper  # type: ignore
+        return _transcribe_faster_whisper(mp3_path)
+    except Exception as exc:  # noqa: BLE001 — any import/instantiation failure
+        print(
+            f"  [warn] faster-whisper backend unavailable ({exc.__class__.__name__}: "
+            f"{exc}) — falling back to openai-whisper")
+        return _transcribe_openai_whisper(mp3_path)
+
+
+def _faster_whisper_device_and_compute() -> tuple[str, str]:
+    """Map WHISPER_DEVICE (or auto) to a (device, compute_type) for CTranslate2.
+
+    faster-whisper has no MPS backend, so mps (and auto-selected mps) map to
+    CPU int8 — the fastest CPU option and a no-accuracy-loss win on Apple
+    Silicon per our benchmark. cuda uses float16; cpu uses int8.
+    """
+    device = _best_torch_device(WHISPER_DEVICE)
+    if device == "cuda":
+        return "cuda", "float16"
+    if device == "mps":
+        print("  [info] faster-whisper has no MPS backend — using device=cpu, "
+              "compute_type=int8 (fastest on Apple Silicon)")
+        return "cpu", "int8"
+    return "cpu", "int8"
+
+
+def _transcribe_faster_whisper(mp3_path: Path) -> list[dict[str, Any]]:
+    """Transcribe with faster-whisper (CTranslate2). Same output shape as the
+    openai-whisper path: a flat ``[{word, start, end}]`` list."""
+    import time
+
+    from faster_whisper import WhisperModel
+
+    device, compute_type = _faster_whisper_device_and_compute()
+    print(f"  Loading faster-whisper model '{WHISPER_MODEL}' "
+          f"(device={device}, compute_type={compute_type}) ...")
+    model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type)
+
+    print(f"  Transcribing {mp3_path.name} with faster-whisper ...")
+    t0 = time.monotonic()
+    segments, _info = model.transcribe(
+        str(mp3_path),
+        word_timestamps=True,
+        language="en",
+        condition_on_previous_text=False,  # prevents hallucination loops
+        vad_filter=True,                   # drop non-speech regions
+    )
+
+    words: list[dict[str, Any]] = []
+    for segment in segments:  # generator — iterating runs the transcription
+        # Respect the same no-speech intent as the openai path where the info
+        # is available (vad_filter already removes most silence).
+        if getattr(segment, "no_speech_prob", 0.0) > 0.6:
+            continue
+        for w in (segment.words or []):
+            words.append(
+                {
+                    # faster-whisper word objects expose .word/.start/.end;
+                    # .word keeps the leading space like openai-whisper does.
+                    "word": w.word,
+                    "start": w.start if w.start is not None else 0.0,
+                    "end": w.end if w.end is not None else 0.0,
+                }
+            )
+
+    elapsed = time.monotonic() - t0
+    print(f"  faster-whisper done in {elapsed:.1f}s "
+          f"(device={device}, compute_type={compute_type}, {len(words)} words)")
+    return words
+
+
+def _transcribe_openai_whisper(mp3_path: Path) -> list[dict[str, Any]]:
+    """Transcribe with openai-whisper (reference implementation). Returns a flat
+    ``[{word, start, end}]`` list."""
+    import time
+
+    try:
+        import whisper
     except ImportError:
         print("ERROR: openai-whisper is not installed.  Run: pip install openai-whisper")
         sys.exit(1)
 
-    import torch  # type: ignore
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  Loading Whisper model 'base' (device={device})...")
-    model = whisper.load_model("base", device=device)
+    # Default openai-whisper to CPU when no device is forced: our benchmark
+    # shows MPS is slower than CPU for whisper 'base'. WHISPER_DEVICE still wins.
+    device = _best_torch_device(WHISPER_DEVICE or "cpu")
+    if device == "mps":
+        _patch_whisper_mps_dtw()
+    print(f"  Loading Whisper model '{WHISPER_MODEL}' (device={device})...")
+    # Load in fp32. Whisper on MPS has known issues with float16/sparse ops, so
+    # we keep weights in fp32 there (and on CPU); fp16 is only safe on cuda.
+    model = whisper.load_model(WHISPER_MODEL, device=device)
 
-    print(f"  Transcribing {mp3_path.name} ...")
+    # fp16 only on cuda; MPS/CPU run fp32 to avoid unsupported-op crashes.
+    use_fp16 = device == "cuda"
+
+    print(f"  Transcribing {mp3_path.name} (device={device}, fp16={use_fp16}) ...")
+    t0 = time.monotonic()
     result = model.transcribe(
         str(mp3_path),
         word_timestamps=True,
@@ -128,6 +307,7 @@ def transcribe_file(mp3_path: Path) -> list[dict[str, Any]]:
         no_speech_threshold=0.6,           # suppress segments likely to be silence
         logprob_threshold=-1.0,            # discard low-confidence segments
         language="en",
+        fp16=use_fp16,
     )
 
     words: list[dict[str, Any]] = []
@@ -143,6 +323,10 @@ def transcribe_file(mp3_path: Path) -> list[dict[str, Any]]:
                     "end": w.get("end", 0.0),
                 }
             )
+
+    elapsed = time.monotonic() - t0
+    print(f"  openai-whisper done in {elapsed:.1f}s "
+          f"(device={device}, {len(words)} words)")
     return words
 
 
@@ -158,7 +342,11 @@ def diarize_audio(mp3_path: Path) -> list[dict[str, Any]]:
         [{"start": float, "end": float, "speaker": str}, ...]
 
     Speaker labels are pyannote's internal IDs, e.g. "SPEAKER_00".
-    Requires HF_TOKEN env var and accepted model license at:
+
+    Uses DIARIZATION_MODEL (default pyannote/speaker-diarization-community-1),
+    falling back to pyannote/speaker-diarization-3.1 if the primary fails to
+    load. Requires HF_TOKEN and accepted model license(s) at:
+    https://huggingface.co/pyannote/speaker-diarization-community-1
     https://huggingface.co/pyannote/speaker-diarization-3.1
     """
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
@@ -169,26 +357,51 @@ def diarize_audio(mp3_path: Path) -> list[dict[str, Any]]:
         return []
 
     try:
-        from pyannote.audio import Pipeline  # type: ignore
+        from pyannote.audio import Pipeline
     except ImportError:
         print("  [warn] pyannote.audio not installed — skipping diarization")
         print("         Run: pip install pyannote.audio")
         return []
 
-    import torch  # type: ignore
+    import torch
 
-    print("  Loading pyannote speaker-diarization-3.1 pipeline ...")
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        token=hf_token,
-    )
+    # Try the configured model first (default: community-1, the newest/most
+    # accurate pyannote pipeline), then fall back to 3.1 if it fails to load
+    # (e.g. gated access not granted for the primary).
+    primary = os.getenv("DIARIZATION_MODEL", DEFAULT_DIARIZATION_MODEL)
+    candidates = list(dict.fromkeys([primary, FALLBACK_DIARIZATION_MODEL]))
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    pipeline = pipeline.to(torch.device(device))
-    print(f"  Running diarization on {mp3_path.name} (device={device}) ...")
+    pipeline = None
+    active_model = None
+    for model_id in candidates:
+        try:
+            print(f"  Loading pyannote pipeline '{model_id}' ...")
+            pipeline = Pipeline.from_pretrained(model_id, token=hf_token)
+            active_model = model_id
+            break
+        except Exception as exc:  # noqa: BLE001 — try the next candidate
+            print(f"  [warn] could not load '{model_id}': {exc}")
 
-    import whisper as _whisper  # type: ignore
-    from tqdm import tqdm  # type: ignore
+    if pipeline is None:
+        print("  [warn] no diarization pipeline could be loaded — skipping diarization")
+        return []
+
+    # Move to the best device (cuda → mps → cpu). If moving to the GPU raises
+    # (unsupported MPS op during init, etc.), fall back to CPU rather than
+    # failing the whole job.
+    device = _best_torch_device()
+    try:
+        pipeline = pipeline.to(torch.device(device))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [warn] could not move pipeline to {device} ({exc}) — using cpu")
+        device = "cpu"
+        pipeline = pipeline.to(torch.device("cpu"))
+
+    print(f"  Running diarization with '{active_model}' on {mp3_path.name} "
+          f"(device={device}) ...")
+
+    import whisper as _whisper
+    from tqdm import tqdm
 
     # whisper.load_audio pipes raw PCM from ffmpeg — same path that drove transcription
     print(f"  Loading audio for diarization ...")
@@ -424,7 +637,7 @@ def _split_into_paragraphs(
     Uses tiktoken cl100k_base as a fast offline approximation for Gemini token counts.
     """
     try:
-        import tiktoken  # type: ignore
+        import tiktoken
         enc = tiktoken.get_encoding("cl100k_base")
         def count_tokens(text): return len(enc.encode(text))
     except ImportError:
@@ -465,7 +678,7 @@ def identify_speakers(
         return chunks, {}
 
     try:
-        from google import genai  # type: ignore
+        from google import genai
     except ImportError:
         print("  [warn] google-genai not installed — skipping speaker identification")
         return chunks, {}
