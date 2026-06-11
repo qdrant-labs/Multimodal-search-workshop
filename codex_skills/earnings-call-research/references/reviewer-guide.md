@@ -1,22 +1,24 @@
 # Research Tool Review Guide
 
-This PR adds a small user-facing research layer on top of the earnings-call
-workshop corpus. It is intended to show how the exercise tools can become a
-practical data-science and journalism workflow: a reviewer gives a free-text
-research question, receives a finished analysis, and gets an evidence package
-with transcript citations, audio clip paths, structured data, and optional live
-AskNews context.
+This skill adds a small user-facing research layer on top of the earnings-call
+workshop corpus without changing the workshop exercises. It is intended to show
+how the existing corpus can support a practical data-science and journalism
+workflow: a reviewer gives a free-text research question, receives a finished
+analysis, and gets an evidence package with transcript citations, audio clip
+paths, structured data, and optional live AskNews context.
 
 ## Why This Is Valuable
 
-- It turns the MCP search primitives into a complete reviewer-facing workflow.
+- It packages a complete reviewer-facing workflow as a Codex Skill, keeping the
+  base workshop repository usable for future workshops.
 - It works without credentials in transcript-only mode, so maintainers can test
   it quickly.
 - When `ASKNEWS_API_KEY` is available, it adds a high-fidelity DeepNews pass that
   pressure-tests transcript findings against current external context.
 - Every run writes a reproducible evidence package instead of only printing a
   transient answer.
-- The same implementation is available through CLI, MCP, and a Codex Skill.
+- Qdrant/MCP semantic search is opt-in through `--use-qdrant`; the default path
+  scans local transcripts so reviewers do not need solved exercises.
 
 ## Two-Minute Smoke Test
 
@@ -24,8 +26,7 @@ Run this from the repo root. It avoids Qdrant, Gemini, and AskNews so it should
 work in a fresh local review environment after dependencies are installed:
 
 ```bash
-.venv/bin/python -m research.cli \
-  --no-qdrant \
+.venv/bin/python codex_skills/earnings-call-research/scripts/research_brief.py \
   --no-asknews \
   --max-evidence 3 \
   "whats the common theme of the calls available? and whats the industry prognosis?"
@@ -46,8 +47,7 @@ Expected result:
 If `ASKNEWS_API_KEY` is set, run the same workflow without `--no-asknews`:
 
 ```bash
-.venv/bin/python -m research.cli \
-  --no-qdrant \
+.venv/bin/python codex_skills/earnings-call-research/scripts/research_brief.py \
   --max-evidence 3 \
   --asknews-timeout 120 \
   "research cyclic investment in and by AI companies and find evidence for it in earnings calls"
@@ -62,21 +62,20 @@ Expected result:
 - If the network or key fails, the tool still returns the transcript analysis and
   records the AskNews error in the evidence package.
 
-## MCP Review Path
+## Optional Qdrant Review Path
 
-The MCP server exposes the same workflow as:
+If maintainers have a completed workshop MCP/Qdrant setup, they can opt into
+semantic search:
 
-```python
-research_earnings(
-    task_description="compare AI investment language across NVDA, AMZN, AAPL, and TSLA",
-    max_evidence=8,
-    use_semantic_search=True,
-    use_asknews=True,
-)
+```bash
+.venv/bin/python codex_skills/earnings-call-research/scripts/research_brief.py \
+  --use-qdrant \
+  --no-asknews \
+  "compare AI investment language across NVDA, AMZN, AAPL, and TSLA"
 ```
 
-This is useful for Claude/Codex-style agents because the tool returns both
-`analysis_markdown` and structured evidence objects.
+This path is intentionally optional so the skill does not depend on or modify
+exercise solutions in `mcp_server/server.py`.
 
 ## What To Inspect
 
@@ -96,3 +95,6 @@ This is useful for Claude/Codex-style agents because the tool returns both
   publication.
 - AskNews provides external context and source leads, but transcript evidence
   remains the core support for claims about what was said on calls.
+- The PR should only contain files under `codex_skills/earnings-call-research/`;
+  workshop files such as `mcp_server/server.py`, `workshop/exercises.md`, and
+  `README.md` should remain equivalent to upstream.

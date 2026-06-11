@@ -6,15 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
 
 def _find_repo(start: Path) -> Path | None:
     for path in [start, *start.parents]:
-        if (path / "research" / "earnings_research.py").exists() and (
-            path / "mcp_server"
-        ).exists():
+        if (path / "data" / "transcripts").exists() and (path / "workshop").exists():
             return path
     return None
 
@@ -24,7 +23,16 @@ def main() -> None:
     parser.add_argument("task")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--max-evidence", type=int, default=12)
-    parser.add_argument("--no-qdrant", action="store_true")
+    parser.add_argument(
+        "--use-qdrant",
+        action="store_true",
+        help="Optionally use the repo's MCP/Qdrant search if it is already implemented.",
+    )
+    parser.add_argument(
+        "--no-qdrant",
+        action="store_true",
+        help="Compatibility flag; local transcript scoring is already the default.",
+    )
     parser.add_argument("--no-asknews", action="store_true")
     parser.add_argument("--asknews-timeout", type=float, default=120.0)
     parser.add_argument("--package-dir", type=Path)
@@ -43,13 +51,14 @@ def main() -> None:
     if not args.quiet:
         status_callback = lambda message: print(f"[research] {message}", file=sys.stderr)
 
-    sys.path.insert(0, str(repo))
-    from research.earnings_research import DEFAULT_OUTPUT_DIR, run_research_analysis
+    os.environ["EARNINGS_RESEARCH_REPO"] = str(repo)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from earnings_research import DEFAULT_OUTPUT_DIR, run_research_analysis
 
     result = run_research_analysis(
         args.task,
         max_evidence=args.max_evidence,
-        use_qdrant=not args.no_qdrant,
+        use_qdrant=args.use_qdrant and not args.no_qdrant,
         output_dir=args.package_dir or DEFAULT_OUTPUT_DIR,
         write_package=not args.no_package,
         use_asknews=not args.no_asknews,

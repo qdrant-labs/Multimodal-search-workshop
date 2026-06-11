@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(os.getenv("EARNINGS_RESEARCH_REPO", Path.cwd())).resolve()
 TRANSCRIPTS_DIR = REPO_ROOT / "data" / "transcripts"
 AUDIO_CLIPS_DIR = REPO_ROOT / "data" / "audio_clips"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "research_outputs"
@@ -323,7 +323,7 @@ def build_research_brief(
     task: str,
     *,
     max_evidence: int = 12,
-    use_qdrant: bool = True,
+    use_qdrant: bool = False,
     max_queries: int = 5,
 ) -> dict[str, Any]:
     """Return a JSON-serializable research brief for a free-text task."""
@@ -369,7 +369,7 @@ def run_research_analysis(
     task: str,
     *,
     max_evidence: int = 12,
-    use_qdrant: bool = True,
+    use_qdrant: bool = False,
     max_queries: int = 5,
     output_dir: Path | None = None,
     write_package: bool = True,

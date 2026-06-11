@@ -5,26 +5,31 @@ description: Build evidence-backed research briefs from open-ended business, mar
 
 # Earnings Call Research
 
-Use this skill to turn a broad research prompt into a finished earnings-call analysis. The tool prints progress on stderr, prints the final analysis on stdout, and writes an evidence package with a package `README.md`, transcript quotes, point IDs, audio clip paths, and live AskNews context when `ASKNEWS_API_KEY` is available.
+Use this skill to turn a broad research prompt into a finished earnings-call analysis without modifying the workshop exercises. The bundled script prints progress on stderr, prints the final analysis on stdout, and writes an evidence package with a package `README.md`, transcript quotes, point IDs, audio clip paths, and live AskNews context when `ASKNEWS_API_KEY` is available.
 
 ## Quick Start
 
 From the `Multimodal-search-workshop` repo root, run:
 
 ```bash
-.venv/bin/python -m research.cli "research cyclic investment in and by AI companies and find evidence for it in earnings calls"
+.venv/bin/python codex_skills/earnings-call-research/scripts/research_brief.py \
+  "research cyclic investment in and by AI companies and find evidence for it in earnings calls"
 ```
 
-Use local transcript scoring only when Qdrant/Gemini/AskNews credentials or network are unavailable:
+Use transcript-only mode when AskNews credentials or network are unavailable:
 
 ```bash
-.venv/bin/python -m research.cli --no-qdrant --no-asknews "find evidence for AI capex cyclicality"
+.venv/bin/python codex_skills/earnings-call-research/scripts/research_brief.py \
+  --no-asknews \
+  "find evidence for AI capex cyclicality"
 ```
 
 For structured output:
 
 ```bash
-.venv/bin/python -m research.cli --json --output /tmp/earnings-brief.json "compare AI investment language across NVDA, AMZN, AAPL, and TSLA"
+.venv/bin/python codex_skills/earnings-call-research/scripts/research_brief.py \
+  --json \
+  "compare AI investment language across NVDA, AMZN, AAPL, and TSLA" > /tmp/earnings-brief.json
 ```
 
 ## Workflow
@@ -42,6 +47,10 @@ For structured output:
 Read `references/evidence-standards.md` when producing a report for publication, external review, or sensitive business analysis.
 
 Never turn retrieval rank into proof. State whether a quote is direct evidence, contextual evidence, or only a lead.
+
+## Maintainer Review
+
+Read `references/reviewer-guide.md` when reviewing this contribution. It explains the offline smoke test, the AskNews path, and why the PR intentionally leaves workshop exercise files untouched.
 
 ## Skill Wrapper
 
