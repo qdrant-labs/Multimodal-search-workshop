@@ -6,6 +6,27 @@ build-backend = "setuptools.build_meta"
 name = "multimodal-search-workshop"
 version = "0.1.0"
 requires-python = ">=3.12"
+dependencies = [
+    "asknews>=0.13.50",
+    "fastapi>=0.111.0",
+    "google-genai>=1.0.0",
+    "httpx>=0.27.0",
+    "mcp>=1.0.0",
+    "openai-whisper>=20231117",
+    "playwright>=1.44.0",
+    "pyannote-audio>=3.1",
+    "pydantic>=2.0.0",
+    "pydub>=0.25.0",
+    "python-dotenv>=1.0.0",
+    "qdrant-client>=1.9.0",
+    "requests>=2.31.0",
+    "rich>=13.0.0",
+    "static-ffmpeg>=3.0",
+    "tiktoken>=0.7.0",
+    "typer>=0.12.0",
+    "uvicorn>=0.30.0",
+    "yt-dlp>=2026.6.9",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1,0 +1,8 @@
+browser_agent
+cli
+data
+docs
+ingest
+mcp_server
+scripts
+workshop

@@ -136,7 +136,7 @@ detailed, step-by-step instructions.
 
 | Requirement | Notes |
 |---|---|
-| Python 3.12 | `python3 --version`; use `uv` to install if needed |
+| Python 3.12 | `python3 --version`; `uv` will pull it for you if needed |
 | `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com) — free tier |
 | `QDRANT_URL` + `QDRANT_API_KEY` | Qdrant Cloud cluster (pre-provisioned for workshop) |
 | `ASKNEWS_API_KEY` | [AskNews](https://my.asknews.app) — if you want your own free month ($250 value) of AskNews, go to https://my.asknews.app/plans and use promo code `SEARCHWEEK` to get the Spelunker plan (it will ask for payment details, but your card will not be charged for your first month). Then create your API key in your settings at https://my.asknews.app/en/settings/api-credentials. Otherwise, a test key is available that will work for the duration of the workshop. |
@@ -152,29 +152,28 @@ detailed, step-by-step instructions.
 cd BerlinWorkshop
 
 # 2. Install dependencies
-uv venv --python 3.12 && source .venv/bin/activate # if no uv install uv here: https://docs.astral.sh/uv/getting-started/installation/
-python -m ensurepip && python -m pip install -r requirements.txt  # or: uv pip install -r requirements.txt
+uv sync # if no uv install uv here: https://docs.astral.sh/uv/getting-started/installation/
 
 # 3. Copy env template and fill in your API keys
 cp .env.example .env
 nano .env   # set GEMINI_API_KEY, QDRANT_URL, QDRANT_API_KEY
 
 # 4. (Instructor only) Run the ingestion pipeline
-python3 ingest/01_download_audio.py   # download earnings calls from YouTube
-python3 ingest/01b_fetch_benzinga.py   # fetch transcripts and audio from Benzinga API (optional)
-python3 ingest/02_transcribe_and_diarize.py # Whisper transcription → 30s chunks + pyannote diarization + Gemini speaker ID
-python3 ingest/03_embed_and_index.py  # Gemini embeddings → Qdrant Cloud
-python3 ingest/04_build_asknews_context.py                # pre-fetch news (optional)
+uv run ingest/01_download_audio.py   # download earnings calls from YouTube
+uv run ingest/01b_fetch_benzinga.py   # fetch transcripts and audio from Benzinga API (optional)
+uv run ingest/02_transcribe_and_diarize.py # Whisper transcription → 30s chunks + pyannote diarization + Gemini speaker ID
+uv run ingest/03_embed_and_index.py  # Gemini embeddings → Qdrant Cloud
+uv run ingest/04_build_asknews_context.py                # pre-fetch news (optional)
 
 # 5. Register the MCP server with Claude Desktop
-python3 cli/setup_mcp.py install
-python3 cli/setup_mcp.py status           # verify
+uv run cli/setup_mcp.py install
+uv run cli/setup_mcp.py status           # verify
 
 # 6. Open the exercises and start building
 open workshop/exercises.md
 
 # 7. Run the web demo to verify your implementation
-python3 app.py                            # http://localhost:8000
+uv run app.py                            # http://localhost:8000
 ```
 
 ---
