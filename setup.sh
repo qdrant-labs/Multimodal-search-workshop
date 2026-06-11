@@ -8,14 +8,13 @@ echo ""
 
 # 1. Install Python dependencies
 echo "[1/4] Installing Python dependencies..."
-uv venv --python 3.12 && source .venv/bin/activate # if no uv install uv here: https://docs.astral.sh/uv/getting-started/installation/
-python -m ensurepip && python -m pip install -r requirements.txt  # or: uv pip install -r requirements.txt
+uv sync # if no uv install uv here: https://docs.astral.sh/uv/getting-started/installation/
 echo "      Done."
 echo ""
 
 # 2. Install Playwright browser
 echo "[2/4] Installing Playwright Chromium browser..."
-python -m playwright install chromium
+uv run -m playwright install chromium
 echo "      Done."
 echo ""
 
@@ -50,13 +49,13 @@ echo "       ASKNEWS_CLIENT_ID / ASKNEWS_CLIENT_SECRET — from https://asknews.
 echo "       QDRANT_URL       — defaults to http://localhost:6333"
 echo ""
 echo "  2. Run the ingestion pipeline:"
-echo "       python ingest/01_download_audio.py"
-echo "       python ingest/02_transcribe.py"
-echo "       python ingest/03_embed_and_index.py"
-echo "       python ingest/04_cache_asknews.py"
+echo "       run uv ingest/01_download_audio.py"
+echo "       run uv ingest/02_transcribe.py"
+echo "       run uv ingest/03_embed_and_index.py"
+echo "       run uv ingest/04_cache_asknews.py"
 echo ""
 echo "  3. Register the MCP server with Claude:"
-echo "       python cli/setup_mcp.py install"
+echo "       run uv cli/setup_mcp.py install"
 echo ""
 echo "  4. Open workshop/exercises.md and start building!"
 echo ""
