@@ -1,15 +1,17 @@
+# Local environment files
 .env
+*.env*
+!.env.example
 __pycache__/
 *.pyc
 *.pyo
 .DS_Store
-data/qdrant_storage/
-data/embedding_cache.json
 
-
+# Generated local data and analysis outputs
+data/
+research_outputs/
 
 # Environments
-*.env*
 .venv
 env/
 venv/
@@ -31,4 +33,3 @@ dmypy.json
 
 *_basic/
 scraps/
-data/

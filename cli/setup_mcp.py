@@ -57,6 +57,12 @@ def _build_server_entry() -> dict[str, Any]:
     }
 
 
+def _repo_relative_path(value: str) -> Path:
+    """Resolve repo-local paths the same way the MCP server does."""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     if path.exists():
         try:
@@ -152,25 +158,34 @@ def status() -> None:
     from dotenv import load_dotenv
 
     load_dotenv(REPO_ROOT / ".env")
-    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_url = os.getenv("QDRANT_URL") or None
+    qdrant_api_key = os.getenv("QDRANT_API_KEY") or None
+    qdrant_path = _repo_relative_path(os.getenv("QDRANT_PATH") or "./data/qdrant_storage")
+    collection_name = os.getenv("COLLECTION_NAME", "earnings_calls")
     try:
-        import httpx
+        from qdrant_client import QdrantClient
 
-        resp = httpx.get(f"{qdrant_url}/healthz", timeout=3.0)
-        qdrant_ok = resp.status_code == 200
+        if qdrant_url:
+            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+            detail_base = qdrant_url
+        else:
+            client = QdrantClient(path=str(qdrant_path))
+            detail_base = str(qdrant_path)
+        point_count = client.count(collection_name).count
         table.add_row(
             "Qdrant",
-            "[green]Reachable[/green]" if qdrant_ok else "[red]Unreachable[/red]",
-            qdrant_url,
+            "[green]Reachable[/green]",
+            f"{detail_base} ({point_count} point(s) in {collection_name})",
         )
     except Exception as exc:
-        table.add_row("Qdrant", "[red]Unreachable[/red]", f"{qdrant_url}  ({exc})")
+        detail_base = qdrant_url or str(qdrant_path)
+        table.add_row("Qdrant", "[red]Unreachable[/red]", f"{detail_base}  ({exc})")
 
     # ── 5. Data files ──────────────────────────────────────────────────────────
     data_checks = {
         "Audio files": (REPO_ROOT / "data" / "audio", "*.mp3"),
         "Transcripts": (REPO_ROOT / "data" / "transcripts", "*.json"),
-        "Embedding cache": (REPO_ROOT / "data", "embedding_cache.json"),
+        "Embedding cache": (REPO_ROOT / "data", "embedding_cache*.json"),
         "AskNews cache": (REPO_ROOT / "data" / "asknews_cache", "*.json"),
     }
     for label, (directory, pattern) in data_checks.items():

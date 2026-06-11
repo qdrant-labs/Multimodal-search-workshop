@@ -132,6 +132,46 @@ detailed, step-by-step instructions.
 
 ---
 
+## Research Brief Tool
+
+For open-ended data-science or journalism prompts, the repo includes a small
+research layer that prints a finished analysis and writes an evidence package as
+a side effect. By default it also runs a live AskNews DeepNews pass when
+`ASKNEWS_API_KEY` is set, then saves that external context beside the transcript
+evidence.
+
+```bash
+.venv/bin/python -m research.cli \
+  "research cyclic investment in and by AI companies and find evidence for it in earnings calls"
+```
+
+Each run creates `research_outputs/<timestamp>_<task>/` with `analysis.md`,
+`evidence.md`, `evidence.json`, `asknews_context.md`, `asknews_context.json`, and
+`manifest.json`. The MCP server also exposes this as
+`research_earnings(task_description, ...)`, so Claude/Codex can request a
+structured analysis directly. If Qdrant, Gemini, or AskNews are unavailable, run
+the local transcript-only mode:
+
+```bash
+.venv/bin/python -m research.cli --no-qdrant --no-asknews "find evidence for AI capex cyclicality"
+```
+
+A Codex Skill package for this workflow lives in
+[`codex_skills/earnings-call-research`](codex_skills/earnings-call-research).
+For local Codex development, expose the project skill with a symlink:
+
+```bash
+mkdir -p ~/.codex/skills
+ln -sfn "$PWD/codex_skills/earnings-call-research" \
+  ~/.codex/skills/earnings-call-research
+```
+
+Generated evidence packages and embedding caches are local artifacts. They live
+under `research_outputs/` and `data/` and should not be included in source
+changes for a public PR.
+
+---
+
 ## Prerequisites
 
 | Requirement | Notes |

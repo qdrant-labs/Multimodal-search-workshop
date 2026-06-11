@@ -1,0 +1,4 @@
+interface:
+  display_name: "Earnings Call Research"
+  short_description: "Evidence briefs from earnings calls"
+  default_prompt: "Use $earnings-call-research to research cyclic AI investment in earnings calls and return evidence-backed findings."
