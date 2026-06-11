@@ -5,7 +5,7 @@ description: Build evidence-backed research briefs from open-ended business, mar
 
 # Earnings Call Research
 
-Use this skill to turn a broad research prompt into a finished earnings-call analysis. The tool prints the analysis and writes an evidence package with transcript quotes, point IDs, audio clip paths, and live AskNews context when `ASKNEWS_API_KEY` is available.
+Use this skill to turn a broad research prompt into a finished earnings-call analysis. The tool prints progress on stderr, prints the final analysis on stdout, and writes an evidence package with a package `README.md`, transcript quotes, point IDs, audio clip paths, and live AskNews context when `ASKNEWS_API_KEY` is available.
 
 ## Quick Start
 
@@ -32,7 +32,7 @@ For structured output:
 1. Run the CLI with the user's prompt as written.
 2. Give the user the finished analysis from stdout, not the raw evidence table.
 3. Mention the `research_outputs/...` evidence package path.
-4. Check `asknews_context.md` for live external validation and contradictions.
+4. Check the package `README.md` first, then `asknews_context.md` for live external validation and contradictions.
 5. Keep only claims supported by direct or contextual evidence.
 6. Use point IDs with `get_audio_clip` before treating a quote as publishable.
 7. Search for counter-evidence by adding terms such as `risk`, `slowdown`, `digestion`, `ROI`, `capacity`, or `demand normalization`.

@@ -10,7 +10,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRANSCRIPTS_DIR = REPO_ROOT / "data" / "transcripts"
@@ -375,10 +375,12 @@ def run_research_analysis(
     write_package: bool = True,
     use_asknews: bool = True,
     asknews_timeout: float = 120.0,
+    status_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Build a finished analysis and optionally persist its evidence package."""
 
     corpus_mode = is_corpus_question(task)
+    _emit_status(status_callback, "Loading transcripts and building the evidence plan.")
     chunks = load_local_chunks()
     brief = build_research_brief(
         task,
@@ -388,10 +390,15 @@ def run_research_analysis(
     )
 
     if corpus_mode:
+        _emit_status(
+            status_callback,
+            "Detected a broad corpus question; synthesizing themes across all calls.",
+        )
         theme_package = build_corpus_theme_package(chunks)
         analysis_markdown = render_corpus_analysis(task, theme_package)
         mode = "corpus_analysis"
     else:
+        _emit_status(status_callback, "Ranking transcript evidence for the prompt.")
         theme_package = None
         analysis_markdown = render_targeted_analysis(brief)
         mode = "targeted_evidence_analysis"
@@ -403,6 +410,7 @@ def run_research_analysis(
         theme_package=theme_package,
         enabled=use_asknews,
         timeout=asknews_timeout,
+        status_callback=status_callback,
     )
     analysis_markdown = integrate_asknews_context(
         analysis_markdown,
@@ -424,6 +432,7 @@ def run_research_analysis(
             result,
             output_dir=output_dir or DEFAULT_OUTPUT_DIR,
         )
+        _emit_status(status_callback, f"Wrote evidence package: {package_path}")
         result["evidence_package"] = str(package_path)
         result["analysis_markdown"] = (
             analysis_markdown.rstrip()
@@ -442,10 +451,12 @@ def build_asknews_research_context(
     theme_package: dict[str, Any] | None,
     enabled: bool,
     timeout: float,
+    status_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Ask DeepNews to validate and enrich the transcript-derived analysis."""
 
     if not enabled:
+        _emit_status(status_callback, "AskNews disabled; using transcript evidence only.")
         return {
             "status": "disabled",
             "analysis": "",
@@ -455,6 +466,10 @@ def build_asknews_research_context(
 
     asknews_key = os.getenv("ASKNEWS_API_KEY", "")
     if not asknews_key:
+        _emit_status(
+            status_callback,
+            "ASKNEWS_API_KEY is not set; using transcript evidence only.",
+        )
         return {
             "status": "skipped",
             "analysis": "",
@@ -481,6 +496,10 @@ def build_asknews_research_context(
             theme_package=theme_package,
         )
 
+        _emit_status(
+            status_callback,
+            "Running live AskNews DeepNews validation; this can take about a minute.",
+        )
         response = ask.chat.get_deep_news(
             messages=[{"role": "user", "content": query}],
             model=ASKNEWS_MODEL,
@@ -559,6 +578,10 @@ def build_asknews_research_context(
                 )
                 seen_article_ids.add(article_id)
 
+        _emit_status(
+            status_callback,
+            f"AskNews returned {len(articles)} cited source records.",
+        )
         return {
             "status": "ok",
             "model": ASKNEWS_MODEL,
@@ -568,6 +591,10 @@ def build_asknews_research_context(
             "query": query,
         }
     except Exception as exc:
+        _emit_status(
+            status_callback,
+            "AskNews failed; continuing with transcript-only analysis.",
+        )
         return {
             "status": "error",
             "analysis": "",
@@ -812,7 +839,9 @@ def write_evidence_package(result: dict[str, Any], *, output_dir: Path) -> Path:
     evidence_json_path = package_dir / "evidence.json"
     asknews_md_path = package_dir / "asknews_context.md"
     asknews_json_path = package_dir / "asknews_context.json"
+    package_readme_path = package_dir / "README.md"
     manifest_path = package_dir / "manifest.json"
+    created_at = datetime.now(timezone.utc).isoformat()
 
     analysis_path.write_text(result["analysis_markdown"])
     if result["theme_package"]:
@@ -833,24 +862,114 @@ def write_evidence_package(result: dict[str, Any], *, output_dir: Path) -> Path:
     )
     asknews_md_path.write_text(render_asknews_markdown(result["asknews_context"]))
     asknews_json_path.write_text(json.dumps(result["asknews_context"], indent=2))
+    package_files = {
+        "analysis": str(analysis_path),
+        "evidence_markdown": str(evidence_md_path),
+        "evidence_json": str(evidence_json_path),
+        "asknews_markdown": str(asknews_md_path),
+        "asknews_json": str(asknews_json_path),
+        "package_readme": str(package_readme_path),
+    }
+    package_readme_path.write_text(
+        render_package_readme(
+            result,
+            package_files=package_files,
+            created_at=created_at,
+        )
+    )
     manifest_path.write_text(
         json.dumps(
             {
                 "task": result["task"],
                 "mode": result["mode"],
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "files": {
-                    "analysis": str(analysis_path),
-                    "evidence_markdown": str(evidence_md_path),
-                    "evidence_json": str(evidence_json_path),
-                    "asknews_markdown": str(asknews_md_path),
-                    "asknews_json": str(asknews_json_path),
-                },
+                "created_at": created_at,
+                "files": package_files,
             },
             indent=2,
         )
     )
     return package_dir
+
+
+def render_package_readme(
+    result: dict[str, Any],
+    *,
+    package_files: dict[str, str],
+    created_at: str,
+) -> str:
+    """Create a reviewer-facing index for a generated evidence package."""
+
+    asknews_context = result.get("asknews_context") or {}
+    asknews_status = asknews_context.get("status", "unknown")
+    evidence = result.get("brief", {}).get("evidence", [])
+    counts = Counter(row.get("strength") for row in evidence)
+    tickers = Counter(row.get("ticker") for row in evidence if row.get("ticker"))
+
+    lines = [
+        "# Research Evidence Package",
+        "",
+        f"Task: {result['task']}",
+        f"Created: {created_at}",
+        f"Mode: `{result['mode']}`",
+        f"AskNews status: `{asknews_status}`",
+        "",
+        "## What To Read First",
+        "",
+        "1. `analysis.md` - the user-facing answer.",
+        "2. `evidence.md` - transcript quotes, point IDs, speakers, and audio clip paths.",
+        "3. `asknews_context.md` - live external validation, contradictions, and cited sources.",
+        "4. `evidence.json` - structured data for reproducibility or downstream analysis.",
+        "",
+        "## Evidence Snapshot",
+        "",
+    ]
+
+    if result.get("theme_package"):
+        corpus = result["theme_package"]["corpus_size"]
+        lines.extend(
+            [
+                f"- Calls scanned: {corpus['calls']}",
+                f"- Transcript chunks scanned: {corpus['chunks']}",
+                f"- Approximate transcript words scanned: {corpus['words']}",
+                f"- Themes surfaced: {len(result['theme_package']['themes'])}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"- Evidence chunks returned: {len(evidence)}",
+                f"- Direct/contextual/lead: {counts.get('direct', 0)}/"
+                f"{counts.get('contextual', 0)}/{counts.get('lead', 0)}",
+                f"- Tickers represented: {', '.join(tickers) or 'none'}",
+            ]
+        )
+
+    lines.extend(["", "## Review Notes", ""])
+    if asknews_status == "ok":
+        lines.append(
+            f"- AskNews returned {len(asknews_context.get('articles') or [])} cited source records."
+        )
+    elif asknews_status == "skipped":
+        lines.append("- AskNews was skipped because `ASKNEWS_API_KEY` was not available.")
+    elif asknews_status == "disabled":
+        lines.append("- AskNews was disabled for this run.")
+    elif asknews_status == "error":
+        lines.append("- AskNews failed; inspect `asknews_context.md` for the captured error.")
+
+    lines.extend(
+        [
+            "- Treat transcript snippets as evidence candidates; verify audio before publishing.",
+            "- Treat AskNews as external context, not a replacement for the transcript evidence.",
+            "- The workshop corpus is intentionally small, so market-wide claims need follow-up sources.",
+            "",
+            "## Files",
+            "",
+        ]
+    )
+    for label, path in package_files.items():
+        lines.append(f"- `{label}`: `{path}`")
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def render_asknews_markdown(asknews_context: dict[str, Any]) -> str:
@@ -1570,6 +1689,14 @@ def _truncate_markdown(text: str, *, limit: int) -> str:
         excerpt
         + "\n\n[Full AskNews memo saved in `asknews_context.md` in the evidence package.]"
     )
+
+
+def _emit_status(
+    status_callback: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    if status_callback:
+        status_callback(message)
 
 
 def _clean_asknews_analysis(text: str) -> str:

@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--asknews-timeout", type=float, default=120.0)
     parser.add_argument("--package-dir", type=Path)
     parser.add_argument("--no-package", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -38,6 +39,9 @@ def main() -> None:
 
     logging.getLogger().setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    status_callback = None
+    if not args.quiet:
+        status_callback = lambda message: print(f"[research] {message}", file=sys.stderr)
 
     sys.path.insert(0, str(repo))
     from research.earnings_research import DEFAULT_OUTPUT_DIR, run_research_analysis
@@ -50,6 +54,7 @@ def main() -> None:
         write_package=not args.no_package,
         use_asknews=not args.no_asknews,
         asknews_timeout=args.asknews_timeout,
+        status_callback=status_callback,
     )
     print(json.dumps(result, indent=2) if args.json else result["analysis_markdown"])
 

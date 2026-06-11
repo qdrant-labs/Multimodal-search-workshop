@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 from research.earnings_research import DEFAULT_OUTPUT_DIR, run_research_analysis
@@ -38,6 +39,11 @@ def main() -> None:
         action="store_true",
         help="Print the full JSON result instead of Markdown analysis.",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress messages on stderr.",
+    )
     parser.add_argument("--output", type=Path, help="Write the finished analysis to a file.")
     parser.add_argument(
         "--package-dir",
@@ -54,6 +60,9 @@ def main() -> None:
 
     logging.getLogger().setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    status_callback = None
+    if not args.quiet:
+        status_callback = lambda message: print(f"[research] {message}", file=sys.stderr)
 
     result = run_research_analysis(
         args.task,
@@ -64,6 +73,7 @@ def main() -> None:
         write_package=not args.no_package,
         use_asknews=not args.no_asknews,
         asknews_timeout=args.asknews_timeout,
+        status_callback=status_callback,
     )
     rendered = (
         json.dumps(result, indent=2)

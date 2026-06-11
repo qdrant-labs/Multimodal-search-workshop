@@ -145,9 +145,11 @@ evidence.
   "research cyclic investment in and by AI companies and find evidence for it in earnings calls"
 ```
 
-Each run creates `research_outputs/<timestamp>_<task>/` with `analysis.md`,
+Each run prints lightweight progress on stderr and creates
+`research_outputs/<timestamp>_<task>/` with `README.md`, `analysis.md`,
 `evidence.md`, `evidence.json`, `asknews_context.md`, `asknews_context.json`, and
-`manifest.json`. The MCP server also exposes this as
+`manifest.json`. The package `README.md` explains what to inspect first and how
+to interpret transcript and AskNews evidence. The MCP server also exposes this as
 `research_earnings(task_description, ...)`, so Claude/Codex can request a
 structured analysis directly. If Qdrant, Gemini, or AskNews are unavailable, run
 the local transcript-only mode:
@@ -169,6 +171,10 @@ ln -sfn "$PWD/codex_skills/earnings-call-research" \
 Generated evidence packages and embedding caches are local artifacts. They live
 under `research_outputs/` and `data/` and should not be included in source
 changes for a public PR.
+
+Maintainers can use the short reviewer guide at
+[`docs/research_tool_review.md`](docs/research_tool_review.md) to run the
+offline smoke test, try the AskNews path, and inspect the evidence package.
 
 ---
 
