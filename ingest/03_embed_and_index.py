@@ -240,7 +240,10 @@ def process_transcript(
     client: Any,
     cache: dict[str, list[float]],
     point_map: dict[str, Any],
+    on_progress: Any = None,
 ) -> int:
+    """Embed + upsert one transcript. `on_progress(done, total)` is invoked
+    per chunk so callers (e.g. background indexing jobs) can track progress."""
     from qdrant_client.models import PointStruct  # type: ignore
 
     data = json.loads(transcript_path.read_text())
@@ -266,7 +269,9 @@ def process_transcript(
     batch: list[PointStruct] = []
     total = 0
 
-    for chunk in tqdm(chunks, desc=f"  {ticker}", unit="chunk"):
+    for chunk_no, chunk in enumerate(tqdm(chunks, desc=f"  {ticker}", unit="chunk"), start=1):
+        if on_progress:
+            on_progress(chunk_no, len(chunks))
         text = chunk.get("text", "").strip()
         if not text:
             continue

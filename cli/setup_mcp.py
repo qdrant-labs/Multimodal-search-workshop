@@ -153,10 +153,12 @@ def status() -> None:
 
     load_dotenv(REPO_ROOT / ".env")
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY", "")
     try:
         import httpx
 
-        resp = httpx.get(f"{qdrant_url}/healthz", timeout=3.0)
+        headers = {"api-key": qdrant_api_key} if qdrant_api_key else {}
+        resp = httpx.get(f"{qdrant_url}/healthz", headers=headers, timeout=5.0)
         qdrant_ok = resp.status_code == 200
         table.add_row(
             "Qdrant",
@@ -170,7 +172,7 @@ def status() -> None:
     data_checks = {
         "Audio files": (REPO_ROOT / "data" / "audio", "*.mp3"),
         "Transcripts": (REPO_ROOT / "data" / "transcripts", "*.json"),
-        "Embedding cache": (REPO_ROOT / "data", "embedding_cache.json"),
+        "Embedding cache": (REPO_ROOT / "data", "embedding_cache_v2.json"),
         "AskNews cache": (REPO_ROOT / "data" / "asknews_cache", "*.json"),
     }
     for label, (directory, pattern) in data_checks.items():
