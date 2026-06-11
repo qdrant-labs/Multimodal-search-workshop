@@ -30,9 +30,12 @@ import hashlib
 import io
 import json
 import os
+import random
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Optional
 
@@ -68,10 +71,31 @@ EMBEDDING_MODEL = "models/gemini-embedding-2"
 BATCH_SIZE = 10
 QDRANT_TIMEOUT_S = 60
 
+# Embedding is I/O-bound on Gemini round-trips (two per chunk), so we fan the
+# chunks out across a bounded thread pool. EMBED_CONCURRENCY caps the number of
+# in-flight Gemini calls; the default of 8 is conservative enough to stay under
+# typical free-tier limits while still giving a large speedup. Set it lower if
+# the key is rate-limited, higher on a paid key.
+EMBED_CONCURRENCY = max(1, int(os.getenv("EMBED_CONCURRENCY", "8") or "8"))
+
+# Per-task exponential backoff (with jitter) for 429s. Unlike the old fixed
+# 60s-per-attempt sleep, this scales per task so a single rate-limited worker
+# doesn't pointlessly stall the whole pool.
+_BACKOFF_BASE_S = float(os.getenv("EMBED_BACKOFF_BASE_S", "2") or "2")
+_BACKOFF_CAP_S = float(os.getenv("EMBED_BACKOFF_CAP_S", "60") or "60")
+_EMBED_MAX_RETRIES = 6
+
 
 # ---------------------------------------------------------------------------
-# Embedding cache
+# Embedding cache (shared across worker threads — guarded by _CACHE_LOCK)
 # ---------------------------------------------------------------------------
+
+# The cache dict is read/written by every worker thread; plain dict mutation is
+# not atomic enough to race on, and json.dumps over a dict being mutated in
+# another thread raises "dictionary changed size during iteration". Both the
+# in-memory access and the on-disk snapshot are therefore serialised here.
+_CACHE_LOCK = threading.Lock()
+
 
 def _load_cache() -> dict[str, list[float]]:
     if CACHE_FILE.exists():
@@ -79,9 +103,23 @@ def _load_cache() -> dict[str, list[float]]:
     return {}
 
 
+def _cache_get(cache: dict[str, list[float]], key: str) -> Optional[list[float]]:
+    with _CACHE_LOCK:
+        return cache.get(key)
+
+
+def _cache_put(cache: dict[str, list[float]], key: str, vec: list[float]) -> None:
+    with _CACHE_LOCK:
+        cache[key] = vec
+
+
 def _save_cache(cache: dict[str, list[float]]) -> None:
     CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps(cache))
+    # Snapshot under the lock so we never serialise a dict that a worker is
+    # concurrently mutating, then write the snapshot outside the lock.
+    with _CACHE_LOCK:
+        snapshot = dict(cache)
+    CACHE_FILE.write_text(json.dumps(snapshot))
 
 
 # ---------------------------------------------------------------------------
@@ -103,28 +141,26 @@ def _client() -> Any:
 
 
 def _embed(contents: Any, cache_key: str, cache: dict[str, list[float]]) -> list[float]:
-    if cache_key in cache:
-        return cache[cache_key]
+    cached = _cache_get(cache, cache_key)
+    if cached is not None:
+        return cached
     client = _client()
-    max_retries = 5
-    for attempt in range(max_retries):
+    for attempt in range(_EMBED_MAX_RETRIES):
         try:
             result = client.models.embed_content(
                 model=EMBEDDING_MODEL, contents=contents)
             vec: list[float] = list(result.embeddings[0].values)
-            cache[cache_key] = vec
+            _cache_put(cache, cache_key, vec)
             return vec
         except Exception as exc:
-            if "429" in str(exc) and attempt < max_retries - 1:
-                wait = 60 * (attempt + 1)
-                for sec in range(wait, 0, -1):
-                    print(
-                        f"\r    [rate limit] retrying in {sec}s "
-                        f"({attempt + 1}/{max_retries})...",
-                        end="", flush=True,
-                    )
-                    time.sleep(1)
-                print("\r" + " " * 60 + "\r", end="", flush=True)
+            if "429" in str(exc) and attempt < _EMBED_MAX_RETRIES - 1:
+                # Concurrency-aware backoff: exponential growth capped at
+                # _BACKOFF_CAP_S, plus per-task jitter so simultaneously
+                # rate-limited workers don't retry in lockstep (and a single
+                # worker's wait never blocks the others).
+                delay = min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
+                delay += random.uniform(0, _BACKOFF_BASE_S)
+                time.sleep(delay)
             else:
                 raise RuntimeError(f"Embedding failed: {exc}") from exc
     raise RuntimeError("Embedding failed after max retries")
@@ -138,8 +174,9 @@ def embed_text(text: str, cache: dict[str, list[float]]) -> list[float]:
 def embed_audio(audio_bytes: bytes, cache: dict[str, list[float]]) -> list[float]:
     from google.genai import types  # type: ignore
     key = "audio:" + hashlib.sha256(audio_bytes).hexdigest()
-    if key in cache:
-        return cache[key]
+    cached = _cache_get(cache, key)
+    if cached is not None:
+        return cached
     part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3")
     return _embed([part], key, cache)
 
@@ -149,14 +186,20 @@ def embed_audio(audio_bytes: bytes, cache: dict[str, list[float]]) -> list[float
 # ---------------------------------------------------------------------------
 
 _FULL_AUDIO_CACHE: dict[str, Any] = {}
+_AUDIO_CACHE_LOCK = threading.Lock()
 
 
 def _load_full_audio(path: Path) -> Any:
     from pydub import AudioSegment  # type: ignore
     key = str(path)
-    if key not in _FULL_AUDIO_CACHE:
-        _FULL_AUDIO_CACHE[key] = AudioSegment.from_file(str(path))
-    return _FULL_AUDIO_CACHE[key]
+    # Guard the shared decode cache so concurrent first-touches of the same
+    # source file don't double-decode or race on the dict. Decoding happens
+    # under the lock; once loaded, the AudioSegment is immutable and safe to
+    # slice from many threads.
+    with _AUDIO_CACHE_LOCK:
+        if key not in _FULL_AUDIO_CACHE:
+            _FULL_AUDIO_CACHE[key] = AudioSegment.from_file(str(path))
+        return _FULL_AUDIO_CACHE[key]
 
 
 def slice_audio_bytes(full_audio_path: Path, start_s: float, end_s: float) -> bytes:
@@ -266,15 +309,25 @@ def process_transcript(
         return 0
 
     CLIPS_DIR.mkdir(parents=True, exist_ok=True)
-    batch: list[PointStruct] = []
-    total = 0
 
-    for chunk_no, chunk in enumerate(tqdm(chunks, desc=f"  {ticker}", unit="chunk"), start=1):
-        if on_progress:
-            on_progress(chunk_no, len(chunks))
+    # Decode the source audio once, up front, so the worker threads only ever
+    # *read*/slice from the shared (now-immutable) AudioSegment — no concurrent
+    # first-touch decode races inside the pool.
+    _load_full_audio(full_audio_path)
+
+    n_chunks = len(chunks)
+
+    def _embed_chunk(chunk: dict[str, Any]) -> Optional[tuple[Any, str, dict[str, Any]]]:
+        """Embed text + audio for one chunk and build its PointStruct.
+
+        Runs on a worker thread. Returns (point, point_id, point_map_entry) or
+        None when the chunk is empty or its embedding fails (the original
+        sequential code skipped both cases too). All shared state it touches —
+        the embedding cache and the audio-decode cache — is internally locked.
+        """
         text = chunk.get("text", "").strip()
         if not text:
-            continue
+            return None
 
         stable_key = f"{ticker}_{quarter}_{year}_{chunk['chunk_index']}"
         point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, stable_key))
@@ -294,7 +347,7 @@ def process_transcript(
             audio_vec = embed_audio(audio_bytes, cache)
         except RuntimeError as exc:
             tqdm.write(f"    [error] chunk {chunk['chunk_index']}: {exc}")
-            continue
+            return None
 
         payload: dict[str, Any] = {
             "ticker": ticker,
@@ -310,25 +363,61 @@ def process_transcript(
             "youtube_id": youtube_id,
             "date": date,
         }
-
-        batch.append(
-            PointStruct(
-                id=point_id,
-                vector={"text": text_vec, "audio": audio_vec},
-                payload=payload,
-            )
+        point = PointStruct(
+            id=point_id,
+            vector={"text": text_vec, "audio": audio_vec},
+            payload=payload,
         )
-        point_map[point_id] = {
+        entry = {
             "audio_file": audio_file,
             "start_time": start_s,
             "end_time": end_s,
         }
+        return point, point_id, entry
 
-        if len(batch) >= BATCH_SIZE:
-            client.upsert(collection_name=COLLECTION_NAME, points=batch)
-            total += len(batch)
-            batch = []
-            _save_cache(cache)
+    batch: list[PointStruct] = []
+    total = 0
+    done = 0
+    progress = tqdm(total=n_chunks, desc=f"  {ticker}", unit="chunk")
+
+    # Fan the chunks out across a bounded pool; each future does both Gemini
+    # round-trips for one chunk, so at most EMBED_CONCURRENCY calls are ever
+    # in flight. Results are consumed as they complete — upsert batching, cache
+    # snapshots and point_map writes all stay on this (single) main thread, so
+    # the output schema is byte-identical to the sequential path; only the
+    # order in which points are batched changes, which Qdrant is agnostic to.
+    cancelled = False
+    executor = ThreadPoolExecutor(max_workers=EMBED_CONCURRENCY)
+    try:
+        pending = {executor.submit(_embed_chunk, chunk) for chunk in chunks}
+        while pending:
+            finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                result = fut.result()
+                done += 1
+                progress.update(1)
+                if result is not None:
+                    point, point_id, entry = result
+                    batch.append(point)
+                    point_map[point_id] = entry
+                    if len(batch) >= BATCH_SIZE:
+                        client.upsert(collection_name=COLLECTION_NAME, points=batch)
+                        total += len(batch)
+                        batch = []
+                        _save_cache(cache)
+                if on_progress:
+                    # on_progress drives the job UI and raises InterruptedError
+                    # on cancellation — propagate it after tearing the pool down.
+                    on_progress(done, n_chunks)
+    except InterruptedError:
+        cancelled = True
+        for fut in pending:
+            fut.cancel()
+        raise
+    finally:
+        progress.close()
+        # Don't wait for in-flight futures when cancelling — return promptly.
+        executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
 
     if batch:
         client.upsert(collection_name=COLLECTION_NAME, points=batch)

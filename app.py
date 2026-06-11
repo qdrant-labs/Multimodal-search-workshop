@@ -6,6 +6,7 @@ Then open: http://localhost:8000
 """
 
 import base64
+import html as html_mod
 import json
 import sys
 import threading
@@ -117,7 +118,8 @@ HTML_PAGE = (
     ".art-badge-bias{background:rgba(120,100,220,0.15);color:#b0a0f0}"
     ".art-badge-type{background:rgba(40,180,160,0.15);color:#50c8b8}"
     ".art-entities{font-size:.7rem;color:#555;margin-top:1px}"
-    ".graph-section{margin-top:16px;border-top:1px solid #2a2d3d;padding-top:14px}"
+    ".graph-section{background:#1a1d27;border:1px solid #2a2d3d;border-radius:12px;"
+    "padding:16px 20px}"
     ".graph-out{margin-top:10px;display:flex;flex-direction:column;gap:10px}"
     ".graph-link{color:#8b9cf8;font-size:.85rem;font-weight:600;text-decoration:none;"
     "align-self:flex-start}"
@@ -129,6 +131,7 @@ HTML_PAGE = (
     ".graph-edges{display:flex;flex-direction:column;gap:4px}"
     ".graph-edge{font-size:.78rem;color:#999;line-height:1.5}"
     ".graph-edge .lbl{color:#50c8b8}"
+    ".graph-query{color:#666;font-size:.74rem;font-style:italic;line-height:1.4}"
     ".graph-err{color:#f87171;font-size:.8rem}"
     ".error{color:#f87171;text-align:center;padding:20px}"
     ".empty{color:#666;text-align:center;padding:40px}"
@@ -260,11 +263,17 @@ HTML_PAGE = (
     "const out=sec.querySelector('.graph-out');"
     "b.disabled=true;b.textContent='Building graph\\u2026';out.innerHTML='';"
     "try{"
-    "const r=await(await fetch('/graph?point_id='+encodeURIComponent(sec.dataset.pid))).json();"
+    "const ctxEl=sec.querySelector('.graph-context');"
+    "const context=ctxEl?ctxEl.textContent:'';"
+    "const r=await(await fetch('/graph',{method:'POST',"
+    "headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({q:sec.dataset.q||'',ticker:sec.dataset.ticker||'',context:context})})).json();"
     "if(r.error){"
     "out.innerHTML=`<div class='graph-err'>${esc(r.error)}</div>`;"
     "b.disabled=false;b.textContent='Build knowledge graph';return;}"
     "let h='';"
+    "if(r.graph_query&&r.graph_query!==(sec.dataset.q||'')){"
+    "h+=`<div class='graph-query'>graph query: ${esc(r.graph_query)}</div>`;}"
     "if(r.visualize_url){"
     "h+=`<a class='graph-link' href='${esc(r.visualize_url)}' target='_blank' rel='noopener'>"
     "Open interactive graph &#8599;</a>`;}"
@@ -528,11 +537,15 @@ def _audio_block(point_id: str) -> str:
 SUMMARY_MODEL = "models/gemini-3.1-flash-lite"
 
 
-def _ai_summary(query: str, results: list[dict]) -> str:
+def _ai_summary(query: str, results: list[dict]) -> tuple[str, str]:
     """Synthesize the retrieved chunks into a cited answer with Gemini Flash Lite.
 
     Sources are numbered 1..N in result order; bracketed citations in the model
     output become anchor links to the matching result card below.
+
+    Returns a (html, plain_text) pair: the rendered HTML block, plus the raw
+    plain-text summary used as HyDE grounding context for the knowledge graph.
+    Both are "" when no summary could be produced.
     """
     import html as html_mod
     import os
@@ -540,7 +553,7 @@ def _ai_summary(query: str, results: list[dict]) -> str:
 
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
-        return ""
+        return "", ""
     try:
         from google import genai
 
@@ -569,7 +582,7 @@ def _ai_summary(query: str, results: list[dict]) -> str:
         response = client.models.generate_content(model=SUMMARY_MODEL, contents=prompt)
         text = (response.text or "").strip()
         if not text:
-            return ""
+            return "", ""
 
         n = len(results)
         escaped = html_mod.escape(text)
@@ -587,15 +600,16 @@ def _ai_summary(query: str, results: list[dict]) -> str:
 
         linked = re.sub(r"\[(\d+)\]", _link, styled)
 
-        return (
+        html_block = (
             '<div class="ai-summary">'
             '<div class="ai-summary-label">AI summary'
             f'<span class="ai-summary-model">{SUMMARY_MODEL.split("/")[-1]}</span></div>'
             f'<div class="ai-summary-text">{linked}</div>'
             "</div>"
         )
+        return html_block, text
     except Exception:
-        return ""  # summary is best-effort; never block results
+        return "", ""  # summary is best-effort; never block results
 
 
 def _render_results(query: str, ticker: str | None = None) -> str:
@@ -616,9 +630,24 @@ def _render_results(query: str, ticker: str | None = None) -> str:
         news_blocks = pool.map(_news_block, pids)
         audio_by_pid = dict(zip(pids, audio_blocks))
         news_by_pid = dict(zip(pids, news_blocks))
-        summary_html = summary_future.result()
+        summary_html, summary_text = summary_future.result()
+
+    # One knowledge-graph block per search, right below the AI summary. The
+    # plain summary text rides along in a hidden element so the lazy graph
+    # builder can POST it as HyDE grounding context (escaped for the HTML
+    # body; the browser decodes it back to plain text via textContent).
+    graph_section = (
+        f'<div class="graph-section" data-q="{html_mod.escape(query, quote=True)}" '
+        f'data-ticker="{html_mod.escape(ticker or "", quote=True)}">'
+        '<div class="news-label">Knowledge graph</div>'
+        f'<div class="graph-context" hidden>{html_mod.escape(summary_text)}</div>'
+        '<button type="button" class="btn-sm btn-ghost graph-btn">Build knowledge graph</button>'
+        '<div class="graph-out"></div>'
+        '</div>'
+    )
 
     cards = [summary_html] if summary_html else []
+    cards.append(graph_section)
     for i, r in enumerate(results, start=1):
         pid    = r["point_id"]
         audio  = audio_by_pid[pid]
@@ -636,11 +665,6 @@ def _render_results(query: str, ticker: str | None = None) -> str:
             f'<div class="quote">{r.get("chunk_text","").replace("  "," ")}</div>'
             f'{audio}'
             f'{news}'
-            f'<div class="graph-section" data-pid="{pid}">'
-            f'<div class="news-label">Knowledge graph</div>'
-            f'<button type="button" class="btn-sm btn-ghost graph-btn">Build knowledge graph</button>'
-            f'<div class="graph-out"></div>'
-            f'</div>'
             f'</div>'
         )
         cards.append(card)
@@ -752,11 +776,21 @@ def ingest_add(req: AddTickerRequest):
     )
 
 
-@app.get("/graph")
-def graph(point_id: str = ""):
-    if not point_id:
-        return {"error": "point_id is required"}
-    return get_news_graph(point_id)
+class GraphRequest(BaseModel):
+    q: str
+    ticker: str | None = None
+    context: str | None = None
+
+
+@app.post("/graph")
+def graph(req: GraphRequest):
+    if not req.q.strip():
+        return {"error": "q is required"}
+    return get_news_graph(
+        req.q,
+        ticker=(req.ticker or None),
+        context=(req.context or None),
+    )
 
 
 @app.get("/search", response_class=HTMLResponse)

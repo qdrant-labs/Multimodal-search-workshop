@@ -26,6 +26,7 @@ Register with Claude Desktop / Claude Code:
 
 import base64
 import functools
+import hashlib
 import json
 import math
 import os
@@ -445,24 +446,40 @@ GRAPH_TOP_NODES = 25
 GRAPH_TOP_EDGES = 40
 # Empirically the graph endpoint reports "No sources recovered" for narrow
 # (±7 day) historical windows and for verbose / ticker-laden keyword queries;
-# a ±30 day window with a plain "{company} earnings" query builds reliably.
+# a 30-day window with a plain query builds reliably.
 GRAPH_WINDOW_DAYS = 30
 
 
-def _compact_graph(raw: dict[str, Any], ticker: str, date: str) -> dict[str, Any]:
-    """Reduce a raw AskNews graph response to the top nodes/edges by count."""
+def _compact_graph(raw: dict[str, Any], query: str, ticker: str | None) -> dict[str, Any]:
+    """Reduce a raw AskNews graph response to the top nodes/edges by count.
+
+    The live API names fields `article_count` / `from_id` / `to_id`; the docs
+    show `count` / `from` / `to` — accept both.
+    """
+
+    def _count(item: dict[str, Any]) -> int:
+        return item.get("count") or item.get("article_count") or 0
+
     full = raw.get("full_graph") or {}
-    nodes = sorted(full.get("nodes") or [], key=lambda n: n.get("count") or 0, reverse=True)
-    edges = sorted(full.get("edges") or [], key=lambda e: e.get("count") or 0, reverse=True)
+    nodes = sorted(full.get("nodes") or [], key=_count, reverse=True)
+    edges = sorted(full.get("edges") or [], key=_count, reverse=True)
     return {
+        "query": query,
+        # The HyDE-expanded query that was actually sent to build_graph
+        # (stashed on the cached raw response for transparency). Falls back
+        # to the raw query for graphs built before HyDE existed.
+        "graph_query": raw.get("_graph_query") or query,
         "ticker": ticker,
-        "date": date,
         "nodes": [
-            {"id": n.get("id"), "type": n.get("type"), "count": n.get("count")}
+            {"id": n.get("id"), "type": n.get("type"), "count": _count(n)}
             for n in nodes[:GRAPH_TOP_NODES]
         ],
         "edges": [
-            {"from": e.get("from"), "label": e.get("label"), "to": e.get("to")}
+            {
+                "from": e.get("from") or e.get("from_id"),
+                "label": e.get("label"),
+                "to": e.get("to") or e.get("to_id"),
+            }
             for e in edges[:GRAPH_TOP_EDGES]
         ],
         "visualize_url": raw.get("visualize_url"),
@@ -470,68 +487,179 @@ def _compact_graph(raw: dict[str, Any], ticker: str, date: str) -> dict[str, Any
     }
 
 
+def _ticker_company(ticker: str) -> str | None:
+    """Look up the company name for a ticker from any indexed point."""
+    sample, _ = _qdrant().scroll(
+        collection_name=COLLECTION,
+        scroll_filter=models.Filter(
+            must=[models.FieldCondition(key="ticker", match=models.MatchValue(value=ticker))]
+        ),
+        limit=1,
+        with_payload=["company"],
+    )
+    return (sample[0].payload or {}).get("company") if sample else None
+
+
+# HyDE (Hypothetical Document Embedding) query expansion for the graph.
+# The user's query at search time is often vague or anaphoric ("how did this
+# compare to the previous quarter?", "what about that segment?"). The AI
+# summary shown above the graph is concrete grounding context — feed both to
+# Gemini and have it rewrite the vague query into ONE entity-anchored,
+# natural-language news-search query that AskNews' graph endpoint can resolve.
+HYDE_MODEL = "models/gemini-3.1-flash-lite"
+
+
+def _hyde_graph_query(query: str, ticker: str | None, context: str) -> str | None:
+    """Rewrite a (possibly vague) query into a concrete graph-search query.
+
+    Resolves anaphora ("this/that/the call/previous quarter") into the
+    concrete companies, people, products, events and timeframe implied by the
+    provided context (the AI summary). Stays grounded ONLY in the context — no
+    invented facts. Keeps the output keyword-rich but readable (a sentence or
+    two), NOT a comma-stuffed entity dump, to respect the AskNews 400002
+    "No sources recovered" constraint. Returns a single plain-text line, or
+    None when Gemini is unavailable/fails so the caller can fall back.
+    """
+    context = (context or "").strip()
+    if not (context and os.getenv("GEMINI_API_KEY")):
+        return None
+    try:
+        from google import genai
+
+        company = _ticker_company(ticker) if ticker else None
+        focus = f"{company} ({ticker})" if company else (ticker or "the company in the context")
+        prompt = (
+            "You rewrite a user's news-search query so a knowledge-graph search "
+            "engine can find relevant articles.\n\n"
+            "CONTEXT (an AI-generated summary of earnings-call search results — "
+            "your ONLY source of truth):\n"
+            f"{context}\n\n"
+            f'USER QUERY: "{query}"\n'
+            f"PRIMARY SUBJECT: {focus}\n\n"
+            "Rewrite the USER QUERY into ONE concise, natural-language news-search "
+            "query that:\n"
+            "- Resolves every vague or relative reference (this, that, it, the "
+            "call, the quarter, previous/next quarter, the segment, prev call) "
+            "into the concrete company names, people, products, events and an "
+            "explicit timeframe implied by the CONTEXT.\n"
+            "- Is grounded ONLY in the CONTEXT. Do not invent facts, numbers, "
+            "tickers, or events that are not supported by it.\n"
+            "- Reads like a natural sentence or two and is keyword-rich, but is "
+            "NOT a comma-separated dump of entities (that breaks the search).\n"
+            "- Names the primary subject company explicitly.\n\n"
+            "Return ONLY the rewritten query as a single line of plain text, no "
+            "quotes, no preamble, no markdown."
+        )
+        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        response = client.models.generate_content(model=HYDE_MODEL, contents=prompt)
+        text = (response.text or "").strip()
+        if not text:
+            return None
+        # Collapse to a single line; strip any stray surrounding quotes.
+        line = " ".join(text.splitlines()).strip().strip('"').strip()
+        return line or None
+    except Exception:
+        return None
+
+
 @mcp.tool()
 @fail_soft
-def get_news_graph(point_id: str) -> dict[str, Any]:
+def get_news_graph(
+    query: str,
+    ticker: str | None = None,
+    date_range: str | None = None,
+    context: str | None = None,
+) -> dict[str, Any]:
     """
-    Build an AskNews knowledge graph of news around an earnings call chunk.
+    Build an AskNews knowledge graph of news around a search query.
 
-    Calls the AskNews graph endpoint with a query about the company's earnings
-    and a ±30 day date filter around the call date. The full raw response is
-    cached under data/asknews_cache/graph_*.json and reused on subsequent
-    calls (the graph endpoint consumes AskNews credits).
+    Calls the AskNews graph endpoint with the natural-language query (plus the
+    company name when a ticker is given). News is date-filtered by date_range
+    when provided, otherwise the last GRAPH_WINDOW_DAYS days. The full raw
+    response is cached under data/asknews_cache/graph_*.json and reused on
+    subsequent calls (the graph endpoint consumes AskNews credits).
+
+    When `context` is supplied (e.g. the AI summary rendered above the graph),
+    a HyDE-style query expansion (Gemini) rewrites a vague/anaphoric `query`
+    into a concrete, entity-anchored news-search query grounded in that
+    context before calling build_graph. The expanded query is returned as
+    `graph_query` for transparency; on any failure it falls back to `query`.
 
     Args:
-        point_id: UUID of the Qdrant point returned by search_earnings.
+        query:      Natural-language search query, e.g. "data center demand".
+        ticker:     Optional stock ticker to focus the graph, e.g. "NVDA".
+        date_range: Optional ISO date range "YYYY-MM-DD:YYYY-MM-DD".
+        context:    Optional grounding text (the AI summary) used to resolve
+                    vague references in `query` via HyDE expansion.
 
     Returns:
-        Dict with keys: ticker, date, nodes (top entities, [{id, type, count}]),
-        edges (top relationships, [{from, label, to}]), visualize_url (hosted
-        interactive visualization), triples_url.
-        On error, returns {"error": "<message>"}.
+        Dict with keys: query (raw), graph_query (HyDE-expanded query actually
+        used), ticker, nodes (top entities, [{id, type, count}]), edges (top
+        relationships, [{from, label, to}]), visualize_url (hosted interactive
+        visualization), triples_url. On error, returns {"error": "<message>"}.
     """
-    point = _fetch_point(point_id)
-    if point is None:
-        return {"error": f"Point {point_id} not found in collection {COLLECTION!r}"}
+    query = query.strip()
+    if not query:
+        return {"error": "query is required"}
+    ticker = ticker.strip().upper() if ticker else None
+    context = (context or "").strip()
 
-    payload = point.payload or {}
-    ticker = payload.get("ticker", "")
-    date = payload.get("date", "")
-
-    cache_path = NEWS_CACHE_DIR / f"graph_{ticker}_{date}_{point_id}.json"
+    # Different summaries (contexts) should resolve to different graph queries,
+    # so fold a short hash of the context into the cache key.
+    ctx_hash = hashlib.sha256(context.encode()).hexdigest()[:8] if context else ""
+    cache_key = hashlib.sha256(
+        f"{query}|{ticker or ''}|{date_range or ''}|{ctx_hash}".encode()
+    ).hexdigest()[:16]
+    cache_path = NEWS_CACHE_DIR / f"graph_{cache_key}.json"
     if cache_path.exists():
-        return _compact_graph(json.loads(cache_path.read_text()), ticker, date)
+        return _compact_graph(json.loads(cache_path.read_text()), query, ticker)
 
     api_key = os.getenv("ASKNEWS_API_KEY", "")
     if not api_key:
-        return {"error": "No cached graph for this chunk and no ASKNEWS_API_KEY for a live build."}
-    if not date:
-        return {"error": f"Point {point_id} has no call date — cannot scope the graph."}
+        return {"error": "No cached graph for this query and no ASKNEWS_API_KEY for a live build."}
+
+    if date_range:
+        try:
+            lo, hi = (part.strip() for part in date_range.split(":", 1))
+        except ValueError as exc:
+            raise ValueError(
+                f"date_range must look like YYYY-MM-DD:YYYY-MM-DD, got {date_range!r}"
+            ) from exc
+        start = datetime.fromisoformat(lo).replace(tzinfo=timezone.utc) if lo else None
+        end = datetime.fromisoformat(hi).replace(tzinfo=timezone.utc) if hi else None
+    else:
+        now = datetime.now(timezone.utc)
+        start, end = now - timedelta(days=GRAPH_WINDOW_DAYS), now
+
+    filter_params: dict[str, Any] = {"historical": True}
+    if start:
+        filter_params["start_timestamp"] = int(start.timestamp())
+    if end:
+        filter_params["end_timestamp"] = int(end.timestamp())
+
+    # HyDE expansion when we have grounding context; otherwise keep the
+    # historical behaviour of lightly anchoring the query with the company
+    # name. Either way `graph_query` is what actually hits build_graph.
+    graph_query = _hyde_graph_query(query, ticker, context) if context else None
+    if not graph_query:
+        graph_query = f"{query} {_ticker_company(ticker) or ticker}" if ticker else query
 
     from asknews_sdk import AskNewsSDK  # deferred: only needed on cache miss
 
-    call_day = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    window = (
-        call_day - timedelta(days=GRAPH_WINDOW_DAYS),
-        call_day + timedelta(days=GRAPH_WINDOW_DAYS),
-    )
-
-    company = payload.get("company") or ticker
     sdk = AskNewsSDK(api_key=api_key)
     graph = sdk.news.build_graph(
-        query=f"{company} earnings",
-        filter_params={
-            "historical": True,
-            "start_timestamp": int(window[0].timestamp()),
-            "end_timestamp": int(window[1].timestamp()),
-        },
-        visualize_with="cosmograph",
+        query=graph_query,
+        filter_params=filter_params,
+        visualize_with="cosmograph.app",
     )
 
     raw = graph.model_dump(mode="json")
+    # Stash both queries on the cached raw response for transparency.
+    raw["_query"] = query
+    raw["_graph_query"] = graph_query
     NEWS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(raw, indent=2))
-    return _compact_graph(raw, ticker, date)
+    return _compact_graph(raw, query, ticker)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -904,9 +1032,10 @@ def index_earnings_call(
     per-stage progress you can poll via get_indexing_jobs():
 
         download    yt-dlp pulls the call audio from YouTube
-        chunk       30s clips written to data/audio_clips/
-        transcribe  Gemini flash-lite transcribes each clip
-        embed       gemini-embedding-2 text+audio vectors → Qdrant upsert
+        transcribe  whisper + pyannote diarization when available,
+                    else Gemini flash-lite per 30s clip
+        embed       ingest/03 pipeline: gemini-embedding-2 text+audio
+                    vectors → Qdrant upsert
 
     Args:
         youtube_url: Full YouTube URL of the earnings call recording.
